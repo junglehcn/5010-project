@@ -1,0 +1,410 @@
+---
+title: "5010_project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(feather)
+library(data.table)
+library(viridis)
+library(DT)
+library(lubridate)
+library(magrittr)
+options(tibble.print_max = 5, tibble.print_min = 5)
+```
+
+```{r}
+library(ranger)
+library(keras)
+```
+
+```{r set_up_data, echo=FALSE, message=FALSE}
+members_dt <- fread("members.csv", encoding= "UTF-8", verbose=FALSE)
+songs_dt <- fread("songs.csv", encoding= "UTF-8", verbose=FALSE)
+train_dt <- fread("train.csv", encoding= "UTF-8", verbose=FALSE)
+test_dt <- fread("test.csv", encoding= "UTF-8", verbose=FALSE)
+```
+
+```{r}
+head(members_dt)
+head(songs_dt)
+head(train_dt)
+head(test_dt)
+```
+Songs Features
+```{r}
+top_100 <- function(df, col_name)
+{
+  temp_df <- df %>% 
+    group_by_(col_name) %>% 
+    count %>% 
+    arrange(desc(n)) %>% 
+    print
+  
+  return(temp_df)
+}
+artist_count <- top_100(songs_dt, "artist_name")
+lyricist_count <- top_100(songs_dt, "lyricist")
+composer_count <- top_100(songs_dt, "composer")
+language_count <- top_100(songs_dt, "language")
+songs_dt %<>% 
+  left_join(artist_count, by='artist_name') %>% 
+  left_join(lyricist_count, by='lyricist') %>% 
+  left_join(composer_count, by='composer') %>% 
+  left_join(language_count, by='language') %>% 
+  rename(art_cnt = n.x, lyr_cnt = n.y, cmp_cnt = n.x.x, lng_cnt = n.y.y)
+```
+Songs Features
+```{r}
+genre_count <- songs_dt %>% 
+                  separate(genre_ids, c("one", "two", "three", "four", "five", "six", "seven", "eight"), extra="merge") %>% 
+                  select(one:eight)%>% 
+                  gather(one:eight, key="nth_id", value="genre_ids", na.rm=TRUE) %>% 
+                  group_by(genre_ids) %>% 
+                  count %>% 
+                  arrange(desc(n)) %>% 
+                  print()
+# Multiple Joins with a smaller data set is much cheaper than lookup
+songs_dt %<>% 
+      add_column(no_of_genre = 1:dim(.)[1],
+                 avg_genre_cnt = 1:dim(.)[1]) %>% 
+      separate(genre_ids, c("one", "two", "three", "four", "five", "six", "seven", "eight"), extra="merge") %>% 
+      left_join(genre_count, by = c("one" = "genre_ids")) %>% 
+      left_join(genre_count, by = c("two" = "genre_ids"), suffix = c(".one", ".two")) %>% 
+      left_join(genre_count, by = c("three" = "genre_ids")) %>% 
+      left_join(genre_count, by = c("four" = "genre_ids"), suffix = c(".three", ".four")) %>% 
+      left_join(genre_count, by = c("five" = "genre_ids")) %>% 
+      left_join(genre_count, by = c("six" = "genre_ids"), suffix = c(".five", ".six")) %>% 
+      left_join(genre_count, by = c("seven" = "genre_ids")) %>% 
+      left_join(genre_count, by = c("eight" = "genre_ids"), suffix = c(".seven", ".eight")) 
+```
+Train Features
+```{r}
+count_frame <- function(df, col_name, new_name)
+{
+  return(df %>% 
+           group_by_(col_name) %>% 
+           count %>% 
+           rename_(.dots=setNames('n', new_name)))
+}
+train_song_cnt <- count_frame(train_dt, 'song_id', 'song_cnt')
+train_sst <- count_frame(train_dt, 'source_system_tab', 'sst_cnt')
+train_ssn <- count_frame(train_dt, 'source_screen_name', 'ssn_cnt')
+train_st <- count_frame(train_dt, 'source_type', 'st_cnt')
+```
+# Reducing the number of categories into four categories based on interest (approximation)
+# 0 - high interest - local and search
+# 1 - random on internet
+# 2 - random
+# 3 - social
+```{r}
+train_dt %<>% 
+  mutate(sst = ifelse((source_system_tab %in% c('my library', 'search')), 0, 
+               ifelse((source_system_tab %in% c('discover', 'explore', 'radio')), 1,
+               ifelse((source_system_tab %in% c('null', '', 'notification', 'settings')), 2, 3)))) %>%
+  mutate(ssn = ifelse((source_screen_name %in% c('Payment', 'My library', 'My library_Search',
+                                                 'Local playlist more', 'Search')), 0,
+               ifelse((source_screen_name %in% c('Album more', 'Artist more', 'Concert', 'Discover Chart',
+                                                 'Discover Feature', 'Discover Genre', 'Discover New',
+                                                 'Explore', 'Radio')), 1,
+               ifelse((source_screen_name %in% c('People global', 'People local', 'Search Home',
+                                                 'Search Trends', ' Self Profile more')), 2, 3)))) %>% 
+  mutate(st = ifelse((source_type %in% c('local-library', 'local-playlist')), 0,
+                        ifelse((source_type %in% c('artist', 'album', 'my-daily-playlist',
+                                                   'online-playlist', 'radio', 'song-based-playlist',
+                                                   'top-hits-for-artist', 'topic-article-playlist', 'song')), 1, 2))) 
+```
+Test Features
+```{r}
+count_frame <- function(df, col_name, new_name)
+{
+  return(df %>% 
+           group_by_(col_name) %>% 
+           count %>% 
+           rename_(.dots=setNames('n', new_name)))
+}
+test_song_cnt <- count_frame(test_dt, 'song_id', 'song_cnt')
+test_sst <- count_frame(test_dt, 'source_system_tab', 'sst_cnt')
+test_ssn <- count_frame(test_dt, 'source_screen_name', 'ssn_cnt')
+test_st <- count_frame(test_dt, 'source_type', 'st_cnt')
+test_dt %<>% 
+  mutate(sst = ifelse((source_system_tab %in% c('my library', 'search')), 0, 
+               ifelse((source_system_tab %in% c('discover', 'explore', 'radio')), 1,
+               ifelse((source_system_tab %in% c('null', '', 'notification', 'settings')), 2, 3)))) %>%
+  mutate(ssn = ifelse((source_screen_name %in% c('Payment', 'My library', 'My library_Search',
+                                                 'Local playlist more', 'Search')), 0,
+               ifelse((source_screen_name %in% c('Album more', 'Artist more', 'Concert', 'Discover Chart',
+                                                 'Discover Feature', 'Discover Genre', 'Discover New',
+                                                 'Explore', 'Radio')), 1,
+               ifelse((source_screen_name %in% c('People global', 'People local', 'Search Home',
+                                                 'Search Trends', ' Self Profile more')), 2, 3)))) %>% 
+  mutate(st = ifelse((source_type %in% c('local-library', 'local-playlist')), 0,
+                        ifelse((source_type %in% c('artist', 'album', 'my-daily-playlist',
+                                                   'online-playlist', 'radio', 'song-based-playlist',
+                                                   'top-hits-for-artist', 'topic-article-playlist', 'song')), 1, 2))) 
+```
+
+members
+```{r}
+standard_time <- function(i){
+  # i is numeric of form 20170101
+  dd<-as.character(i)
+  paste0(substr(dd, 1, 4), "-", 
+         substr(dd, 5, 6), "-",
+         substr(dd, 7, 8))
+}
+
+members_dt[, registration_year := as.integer(substr(
+  standard_time(registration_init_time), 1, 4))]
+members_dt[, registration_month := as.integer(substr(
+  standard_time(registration_init_time), 6,7))]
+members_dt[, expiration_year := as.integer(substr(
+  standard_time(expiration_date), 1, 4))]
+members_dt[, expiration_month := as.integer(substr(
+  standard_time(expiration_date), 6,7))]
+
+members_dt[, registration_init_time :=
+             as.Date(standard_time(registration_init_time))]
+members_dt[, expiration_date :=
+             as.Date(standard_time(expiration_date))]
+```
+
+```{r}
+#------ So, now finish up
+cnames <- colnames(train_dt)
+train_dt = cbind(index(train_dt),train_dt)
+colnames(train_dt)<-c("id",cnames)
+
+cnames <- colnames(test_dt)
+test_dt = cbind(test_dt[,1:6],as.vector(rep(-1,nrow(test_dt))),test_dt[,7:9])
+colnames(test_dt)<-c(cnames[1:6],"target",cnames[7:9])
+
+both<- rbind(train_dt, test_dt)
+
+#------ Merge both with songs and members
+both <- merge(both, members_dt, by = "msno", all.x=TRUE)
+both <- merge(both, songs_dt, by = "song_id", all.x=TRUE)
+
+both <- data.table(both)
+for (f in names(both)){
+  if( class(both[[f]]) == "character"){
+    both[is.na(both[[f]]), eval(f) := ""]
+    both[, eval(f) := as.integer(
+      as.factor(both[[f]]))]
+  } else both[is.na(both[[f]]), eval(f) := -1]
+}
+both[, registration_init_time := julian(registration_init_time)]
+both[, expiration_date := julian(expiration_date)]
+both[, length_membership := 
+       expiration_date - registration_init_time]
+# ------- final cleanup --  we leave id in!
+setDF(both)
+train_df <- both[both$target != -1,]
+test_df <- both[both$target == -1,]
+train_id <- train_df$id
+train_df$id <- NULL
+test_df$target <- NULL
+y<- train_df$target
+test_id <- test_df$id
+train_df$target <- NULL
+test_df$id <- NULL
+
+train_df<- train_df[order(train_id), ]
+y<- y[order(train_id)]
+test_df<- test_df[order(test_id), ]
+
+```
+
+```{r aux_from_my_lib}
+# au/ roc, avoid overflow error in Metrics::auc 
+my_auc <- function(true_Y, probs) {
+  # 
+  N <- length(true_Y)
+  if (length(probs) != N)
+    return (NULL) # error
+  if (is.factor(true_Y)) true_Y <- as.numeric(as.character(true_Y))
+  roc_y <- true_Y[order(probs, decreasing = FALSE)]
+  stack_x = cumsum(roc_y == 1) / sum(roc_y == 1)
+  stack_y = cumsum(roc_y == 0) / sum(roc_y == 0)
+  auc = sum((stack_x[2:N] - stack_x[1:(N - 1)]) * stack_y[2:N])
+  return(auc)
+}
+
+auc <- function(a,p) my_auc(a,p)
+
+#binary cross_entropy
+bce <- function(actual, probs){
+  probs <- ifelse(probs >0, probs, 10^-10)
+  return ( - mean(actual* log(probs)))
+}
+# mean logloss
+mll <- function(actual, probs){
+  probs <- ifelse(probs >0, probs, 10^-10)
+  return ( mean(Metrics::ll(actual, probs)))
+}
+# accuracy
+acc <- function(actual, probs, theta=0.5){
+  probs <- ifelse(probs > theta, 1, 0)
+  return(mean(probs == actual))
+}
+
+# root mean squared error
+rmse <- function(actuals, prediction) sqrt(mean((actuals-prediction)^2))
+
+diagnosis <- function(actual, probs, title=""){
+  cat("\nSummary results for", title
+    , "\nauc:", auc(actual, probs)
+      , "\nacc:", acc(actual, probs)
+      , "\nbce:", bce(actual, probs)
+      , "\nmll:", mll(actual, probs)
+      , "\nrmse:", rmse(actual, probs)
+      , "\n"
+      )
+}
+
+# primitive (0,1) calibration
+to_p <- function(r) {
+  r <- r - min(r)
+  return(r / max(r))
+}
+
+```
+
+```{r eval_split}
+# ---------------------------------------------
+set.seed(3141569)
+E_SIZE <- 0.185
+h<- sample(nrow(train_df), E_SIZE*nrow(train_df))
+ens_val <- train_df[h, ]
+y_ens_val <- y[h]
+train_df <- train_df[-h, ]
+y <- y[-h]
+
+# now only _after_ this split we can scale the columns
+to_do <- names(train_df)
+for (f in to_do){
+  mm<- mean(train_df[[f]])
+  ss<- sd(train_df[[f]])
+  train_df[[f]] <- (train_df[[f]] -mm)/ss
+  test_df[[f]] <- (test_df[[f]] -mm)/ss
+  ens_val[[f]] <- (ens_val[[f]] -mm)/ss
+}
+
+# shrink? Then use this subset
+subs <- sample(nrow(train_df), 0.3 *nrow(train_df))
+
+```
+
+```{r ranger}
+rf <- ranger(y[subs] ~ . , data = train_df[subs,], num.trees = 12
+             , verbose= FALSE)
+
+pred_1_e<-predict(rf, ens_val, type = "response")
+pred_1_e <- pred_1_e$predictions
+pred_1_t<-predict(rf, test_df, type = "response")
+pred_1_t <- pred_1_t$predictions
+
+library(Metrics)
+diagnosis(y_ens_val, pred_1_e, title="ranger")
+
+```
+
+```{r nnet}
+B_Size= 2^15
+x_train<- as.matrix(train_df)
+y_train<- as.matrix(data.frame(p=1-y, q=y))
+
+model <- keras_model_sequential()
+model %>%
+    layer_dense(
+      units= 128,
+      input_shape = c(ncol(x_train)),
+      kernel_initializer='he_normal' #,
+    ) %>%
+    layer_activation("relu") %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate= 0.1) %>%
+
+    layer_dense(
+      units= 512,
+      kernel_initializer='he_normal' #,
+    ) %>%
+    layer_activation("relu") %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate= 0.3) %>%
+
+    layer_dense(
+      units= 64,
+      kernel_initializer='he_normal' #,
+    ) %>%
+    layer_activation("relu") %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate= 0.1) %>%
+
+    layer_dense(2) %>%
+    layer_activation("softmax")
+
+model %>% compile(
+    loss = 'categorical_crossentropy',
+    optimizer = optimizer_rmsprop(),
+    metrics = c("accuracy")
+  )
+
+history <- model %>% fit(
+    x_train, y_train, verbose=2, 
+    view_metrics = FALSE, 
+    epochs = 7, batch_size =B_Size, 
+    validation_split = 0.1
+  )
+
+pred_2_e <- model %>% predict(as.matrix(ens_val[, to_do])
+                , batch_size = B_Size)
+pred_2_t <- model %>% predict(as.matrix(test_df[, to_do])
+                , batch_size = B_Size)
+pred_2_e <- pred_2_e [,2]
+pred_2_t <- pred_2_t [,2]
+diagnosis(y_ens_val, pred_2_e
+          , title="keras")
+
+```
+
+
+```{r using optim}
+cat("\n=== Optimizing for ensemble start:",  format(Sys.time()), "===\n")
+
+e_m<- cbind(V1= to_p(pred_1_e),
+             V2= to_p(pred_2_e)
+             )
+
+t_m<- cbind(V1= to_p(pred_1_t),
+             V2= to_p(pred_2_t)
+             )
+
+m_fun <- function(par){
+  return(1-auc(y_ens_val, (e_m %*% par)/sum(par)))
+}
+start_par=rep(1, ncol(e_m))/ ncol(e_m)
+a <- optim(start_par, m_fun, method= "L-BFGS-B",
+      lower = 0, upper = 1)
+#
+submit_prediction <- (t_m %*% a$par)/sum(a$par)
+#
+diagnosis(y_ens_val, (e_m %*% a$par)/sum(a$par), title="optimizer"); cat(
+   "\n=== Ensembling end:",  format(Sys.time()), 
+   "===\n=== with parameters", unlist(round(a$par/sum(a$par),3)), "\n")
+```
+
+```{r submit}
+require(readr)
+subm <- read_csv("sample_submission.csv")
+subm$id<- as.integer(subm$id)
+subm[, 2] <- round(submit_prediction, 3)
+write.csv(subm, "5010.csv", row.names = F) 
+```
+
+
